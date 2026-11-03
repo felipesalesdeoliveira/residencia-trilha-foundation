@@ -1,4 +1,5 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { captureAWSv3Client } from "aws-xray-sdk-core";
 import {
   DynamoDBDocumentClient,
   GetCommand,
@@ -6,7 +7,7 @@ import {
 } from "@aws-sdk/lib-dynamodb";
 import type { OrderEvent, OrderProcessor, ProcessingResult } from "./types.js";
 
-const client = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
+const client = DynamoDBDocumentClient.from(captureAWSv3Client(new DynamoDBClient({})), {
   marshallOptions: { removeUndefinedValues: true },
 });
 

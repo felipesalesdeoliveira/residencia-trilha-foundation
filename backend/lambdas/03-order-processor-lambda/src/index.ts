@@ -18,6 +18,7 @@ const parseOrder = (record: SQSRecord): OrderEvent => {
     "quantity",
     "occurredAt",
     "idempotencyKey",
+    "correlationId",
   ];
   requiredFields.forEach((field) => required(order, field));
   return order as OrderEvent;
@@ -28,19 +29,22 @@ export const handler = async (event: SQSEvent): Promise<SQSBatchResponse> => {
   const batchItemFailures: SQSBatchResponse["batchItemFailures"] = [];
 
   for (const record of event.Records) {
+    let order: OrderEvent | undefined;
     try {
-      const order = parseOrder(record);
+      order = parseOrder(record);
       const result = await processor.process(order);
       console.info("order-processed", {
         messageId: record.messageId,
         orderId: order.orderId,
         idempotencyKey: order.idempotencyKey,
+        correlationId: order.correlationId,
         result,
       });
     } catch (error) {
       const failure = error instanceof Error ? error : new Error("Unknown error");
       console.error("order-processing-failed", {
         messageId: record.messageId,
+        correlationId: order?.correlationId ?? "unknown",
         message: failure.message,
         stack: failure.stack,
       });

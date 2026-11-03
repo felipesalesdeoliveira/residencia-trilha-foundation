@@ -4,6 +4,7 @@ using Amazon.Lambda.Core;
 using Amazon.Lambda.Serialization.SystemTextJson;
 using Amazon.SQS;
 using Amazon.SQS.Model;
+using Amazon.XRay.Recorder.Handlers.AwsSdk;
 using Residencia.Foundation.Orders.Data;
 
 [assembly: LambdaSerializer(typeof(DefaultLambdaJsonSerializer))]
@@ -12,6 +13,11 @@ namespace Residencia.Foundation.Orders;
 
 public sealed class Function
 {
+    static Function()
+    {
+        AWSSDKHandler.RegisterXRayForAllServices();
+    }
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly ICommerceRepository _repository;
     private readonly IAmazonSQS _sqs;
@@ -47,7 +53,7 @@ public sealed class Function
                 ?? new Dictionary<string, string>();
 
             if (method == "POST" && path == "/orders")
-                return await CreateOrder(request, claims);
+                return await CreateOrder(request, claims, context);
 
             if (method == "GET" && path == "/orders")
                 return await ListBuyerOrders(claims);
@@ -70,7 +76,8 @@ public sealed class Function
 
     private async Task<APIGatewayProxyResponse> CreateOrder(
         APIGatewayProxyRequest request,
-        IDictionary<string, string> claims
+        IDictionary<string, string> claims,
+        ILambdaContext context
     )
     {
         var input = JsonSerializer.Deserialize<CreateOrderRequest>(request.Body ?? "{}", JsonOptions);
@@ -83,6 +90,7 @@ public sealed class Function
 
         var orderId = Guid.NewGuid().ToString();
         var createdAt = DateTimeOffset.UtcNow;
+        var correlationId = request.RequestContext?.RequestId ?? context.AwsRequestId;
         var buyerId = RequiredClaim(claims, "sub");
         var buyerEmail = OptionalClaim(claims, "email");
         var buyerName = OptionalClaim(claims, "name")
@@ -96,6 +104,7 @@ public sealed class Function
             input.Quantity,
             createdAt,
             orderId,
+            correlationId,
             buyerName,
             buyerEmail
         );
@@ -118,6 +127,13 @@ public sealed class Function
             QueueUrl = _queueUrl,
             MessageBody = JsonSerializer.Serialize(orderEvent, JsonOptions),
         });
+
+        context.Logger.LogInformation(JsonSerializer.Serialize(new
+        {
+            eventName = "order-enqueued",
+            orderId,
+            correlationId,
+        }, JsonOptions));
 
         return Json(202, new { orderId, status = "pending", order = pendingOrder });
     }
