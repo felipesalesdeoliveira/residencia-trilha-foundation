@@ -35,6 +35,7 @@ export const handler = async (event: SQSEvent): Promise<SQSBatchResponse> => {
         messageId: record.messageId,
         orderId: order.orderId,
         idempotencyKey: order.idempotencyKey,
+        dataSource: process.env.DATA_SOURCE ?? "mock",
         result,
       });
     } catch (error) {
