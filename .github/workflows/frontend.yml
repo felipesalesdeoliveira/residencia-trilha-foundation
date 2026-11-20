@@ -49,13 +49,20 @@ jobs:
       - name: Registrar versão
         run: node -e 'require("fs").writeFileSync("dist/release.json", JSON.stringify({sha:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID}))'
 
+      - name: Registrar hashes da release
+        run: |
+          cd dist
+          shasum -a 256 index.html release.json assets/* > checksums.sha256
+          shasum -a 256 -c checksums.sha256
+
       - name: Salvar artefato do frontend
         uses: actions/upload-artifact@v4
         with:
           name: frontend
           path: site/dist/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
+
 
   deploy:
     name: Deploy

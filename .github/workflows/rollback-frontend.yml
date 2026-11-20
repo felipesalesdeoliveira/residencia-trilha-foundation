@@ -1,0 +1,169 @@
+name: Rollback Frontend
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_url:
+        description: URL da execução Frontend aprovada que contém a release a restaurar
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-deploy
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Restaurar artefato aprovado
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      FRONTEND_BUCKET: ${{ vars.FRONTEND_BUCKET }}
+      DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+      FRONTEND_URL: ${{ vars.FRONTEND_URL }}
+
+    steps:
+      - name: Identificar execução de origem
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_URL: ${{ inputs.run_url }}
+        run: |
+          source_run_url="${SOURCE_RUN_URL%%\?*}"
+          source_run_url="${source_run_url%/}"
+          source_run_id="${source_run_url##*/}"
+
+          if ! [[ "$source_run_id" =~ ^[0-9]+$ ]]; then
+            echo "A URL informada não contém um Run ID válido."
+            exit 1
+          fi
+
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$source_run_id" > source-run.json
+
+          if ! jq -e '
+            .head_branch == "main" and
+            .status == "completed" and
+            .conclusion == "success" and
+            .path == ".github/workflows/frontend.yml"
+          ' source-run.json > /dev/null; then
+            echo "A execução precisa ser um workflow Frontend concluído com sucesso na main."
+            exit 1
+          fi
+
+          echo "run_id=$source_run_id" >> "$GITHUB_OUTPUT"
+          echo "Run de origem validado: $source_run_id"
+
+      - name: Baixar artefato original
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend
+          path: dist
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.source.outputs.run_id }}
+
+      - name: Validar artefato original
+        id: release
+        env:
+          SOURCE_RUN_ID: ${{ steps.source.outputs.run_id }}
+        run: |
+          cd dist
+          shasum -a 256 -c checksums.sha256
+
+          release_sha=$(node -p 'JSON.parse(require("fs").readFileSync("release.json","utf8")).sha')
+          release_run=$(node -p 'JSON.parse(require("fs").readFileSync("release.json","utf8")).run')
+
+          if [ "$release_run" != "$SOURCE_RUN_ID" ]; then
+            echo "O release.json pertence ao run $release_run, não ao run $SOURCE_RUN_ID."
+            exit 1
+          fi
+
+          echo "sha=$release_sha" >> "$GITHUB_OUTPUT"
+          echo "Release validada: $release_sha"
+
+      - name: Registrar versão atual
+        id: before
+        run: |
+          curl --fail --silent --show-error --retry 3 \
+            "${FRONTEND_URL%/}/release.json" \
+            -o before-release.json
+
+          current_sha=$(node -p 'JSON.parse(require("fs").readFileSync("before-release.json","utf8")).sha')
+          current_run=$(node -p 'JSON.parse(require("fs").readFileSync("before-release.json","utf8")).run')
+
+          echo "sha=$current_sha" >> "$GITHUB_OUTPUT"
+          echo "run=$current_run" >> "$GITHUB_OUTPUT"
+          echo "Versão atual: $current_sha (run $current_run)"
+
+      - name: Autenticar na AWS usando OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: frontend-rollback-${{ github.run_id }}
+
+      - name: Republicar artefato original
+        run: aws s3 sync dist/ "s3://$FRONTEND_BUCKET/" --cache-control 'no-cache'
+
+      - name: Invalidar cache do CloudFront
+        run: |
+          invalidation_id=$(aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths '/*' --query Invalidation.Id --output text)
+          aws cloudfront wait invalidation-completed --distribution-id "$DISTRIBUTION_ID" --id "$invalidation_id"
+
+      - name: Validar versão restaurada
+        env:
+          EXPECTED_SHA: ${{ steps.release.outputs.sha }}
+          EXPECTED_RUN: ${{ steps.source.outputs.run_id }}
+        run: |
+          curl --fail --silent --show-error --retry 3 \
+            "${FRONTEND_URL%/}/release.json" \
+            -o restored-release.json
+
+          restored_sha=$(node -p 'JSON.parse(require("fs").readFileSync("restored-release.json","utf8")).sha')
+          restored_run=$(node -p 'JSON.parse(require("fs").readFileSync("restored-release.json","utf8")).run')
+
+          if [ "$restored_sha" != "$EXPECTED_SHA" ] || [ "$restored_run" != "$EXPECTED_RUN" ]; then
+            echo "A versão restaurada não corresponde ao artefato selecionado."
+            exit 1
+          fi
+
+          while read -r expected_hash file_path; do
+            relative_path="${file_path#./}"
+            actual_hash=$(curl --fail --silent --show-error --retry 3 \
+              "${FRONTEND_URL%/}/$relative_path" \
+              | shasum -a 256 \
+              | awk '{print $1}')
+
+            if [ "$actual_hash" != "$expected_hash" ]; then
+              echo "Hash divergente: $relative_path"
+              exit 1
+            fi
+
+            echo "$relative_path: OK"
+          done < dist/checksums.sha256
+
+      - name: Resumir rollback
+        env:
+          BEFORE_SHA: ${{ steps.before.outputs.sha }}
+          BEFORE_RUN: ${{ steps.before.outputs.run }}
+          RESTORED_SHA: ${{ steps.release.outputs.sha }}
+          RESTORED_RUN: ${{ steps.source.outputs.run_id }}
+        run: |
+          {
+            echo "### Rollback do frontend"
+            echo
+            echo "| Estado | SHA | Run |"
+            echo "|---|---|---|"
+            echo "| Antes | \`$BEFORE_SHA\` | \`$BEFORE_RUN\` |"
+            echo "| Restaurado | \`$RESTORED_SHA\` | \`$RESTORED_RUN\` |"
+            echo
+            echo "Artefato republicado sem rebuild e validado pelo manifesto SHA-256."
+          } >> "$GITHUB_STEP_SUMMARY"
